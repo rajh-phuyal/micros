@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Desert Traffic Simulation</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            margin: 0;
+            padding: 1rem;
+            background: #f5f5f0;
+            color: #333;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #1a1a1a;
+                color: #e0e0e0;
+            }
+        }
+
+        button {
+            padding: 8px 16px;
+            border: 1px solid #d97706;
+            background: #fef3c7;
+            color: #78350f;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        button:hover {
+            background: #fde68a;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            button {
+                background: #44370a;
+                color: #fde68a;
+                border-color: #a16207;
+            }
+
+            button:hover {
+                background: #55440d;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div style="padding: 0.5rem 0;">
+        <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center;">
+            <button id="btn-connect">Connect to Pico</button>
+            <span id="phase-label" style="font-size: 14px; opacity: 0.7;">Disconnected</span>
+        </div>
+        <div style="position: relative; width: 100%; max-width: 640px; margin: 0 auto;">
+            <canvas id="road" width="640" height="280"
+                style="width: 100%; border-radius: 12px; border: 1px solid rgba(128,128,128,0.2);"></canvas>
+        </div>
+    </div>
+    <script>
+        const canvas = document.getElementById('road');
+        const ctx = canvas.getContext('2d');
+        const W = 640, H = 280;
+        const roadW = 94;
+        const roadY = H / 2;
+        const crossX = 320;
+        const stopL = crossX - 56;
+        const stopR = crossX + 56;
+
+        const dk = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const roadC = dk ? '#3d3d3d' : '#4a4a4a';
+        const sideC = dk ? '#333' : '#444';
+        const sandC = dk ? '#3d3222' : '#d4b483';
+        const sandC2 = dk ? '#332a1c' : '#c9a46c';
+        const txtC = dk ? '#e0e0e0' : '#333';
+
+        function gc(s) {
+            return s === 'green' ? '#22c55e' : s === 'yellow' ? '#eab308' : s === 'red' ? '#ef4444' : '#666';
+        }
+
+        const carPalette = ['#3b82f6', '#ef4444', '#8b5cf6', '#f97316', '#06b6d4', '#ec4899', '#10b981', '#64748b', '#a855f7', '#0ea5e9'];
+
+        let tlState = 'green';
+        let pedState = 'red';
+        let btnPressTimer = 0;
+
+        const cars = [];
+        let spawnTimer = 0;
+
+        // --- Web Serial ---
+
+        let port = null;
+
+        function parseLine(line) {
+            if (line.startsWith('normal: ')) {
+                const state = line.slice(8);
+                if (state === 'GREEN') tlState = 'green';
+                else if (state === 'YELLOW') tlState = 'yellow';
+                else if (state === 'RED') tlState = 'red';
+                updateLabel();
+            } else if (line.startsWith('pedestrian: ')) {
+                const state = line.slice(12);
+                if (state === 'PED_RED') pedState = 'red';
+                else if (state === 'PED_GREEN') pedState = 'green';
+                updateLabel();
+            } else if (line === 'BUTTON PRESSED') {
+                btnPressTimer = 20;
+            }
+        }
+
+        function updateLabel() {
+            const label = document.getElementById('phase-label');
+            if (pedState === 'green') {
+                label.textContent = 'Walk — pedestrians crossing';
+            } else if (tlState === 'green') {
+                label.textContent = 'Green — traffic flowing';
+            } else if (tlState === 'yellow') {
+                label.textContent = 'Yellow — slowing';
+            } else if (tlState === 'red') {
+                label.textContent = 'Red — stopped';
+            }
+        }
+
+        async function readSerial(port) {
+            const decoder = new TextDecoderStream();
+            port.readable.pipeTo(decoder.writable);
+            const reader = decoder.readable.getReader();
+            let buffer = '';
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += value;
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (trimmed) parseLine(trimmed);
+                    }
+                }
+            } catch (e) {
+                console.error('Serial read error:', e);
+            }
+            document.getElementById('phase-label').textContent = 'Disconnected';
+            document.getElementById('btn-connect').disabled = false;
+            document.getElementById('btn-connect').textContent = 'Connect to Pico';
+        }
+
+        document.getElementById('btn-connect').addEventListener('click', async () => {
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                document.getElementById('btn-connect').disabled = true;
+                document.getElementById('btn-connect').textContent = 'Connected';
+                document.getElementById('phase-label').textContent = 'Connected — waiting for data...';
+                readSerial(port);
+            } catch (e) {
+                console.error('Failed to connect:', e);
+            }
+        });
+
+        // --- Car simulation ---
+
+        function spawnCar(lane) {
+            const dir = lane === 0 ? 1 : -1;
+            const x = dir === 1 ? -50 : W + 50;
+            const y = roadY + (lane === 0 ? -16 : 16);
+            const speed = 1.0 + Math.random() * 0.5;
+            const color = carPalette[Math.floor(Math.random() * carPalette.length)];
+            const len = 28 + Math.random() * 10;
+            cars.push({ x, y, dir, speed, baseSpeed: speed, color, lane, w: len, h: 16, passedStop: false });
+        }
+
+        function updateCars() {
+            spawnTimer++;
+            if (spawnTimer > 70 + Math.random() * 50) {
+                const lane = Math.random() < 0.5 ? 0 : 1;
+                let canSpawn = true;
+                for (const c of cars) {
+                    if (c.lane === lane) {
+                        if (lane === 0 && c.x < 50) canSpawn = false;
+                        if (lane === 1 && c.x > W - 50) canSpawn = false;
+                    }
+                }
+                if (canSpawn) spawnCar(lane);
+                spawnTimer = 0;
+            }
+
+            for (const c of cars) {
+                if (c.dir === 1 && c.x - c.w / 2 > stopL) c.passedStop = true;
+                if (c.dir === -1 && c.x + c.w / 2 < stopR) c.passedStop = true;
+
+                let targetSpeed = c.baseSpeed;
+                const notGreen = tlState !== 'green';
+
+                if (notGreen && !c.passedStop) {
+                    let myStopX, distToStop;
+                    if (c.dir === 1) {
+                        myStopX = stopL - c.w / 2 - 3;
+                        distToStop = myStopX - c.x;
+                    } else {
+                        myStopX = stopR + c.w / 2 + 3;
+                        distToStop = c.x - myStopX;
+                    }
+                    if (distToStop <= 0) {
+                        targetSpeed = 0;
+                    } else if (distToStop < 300) {
+                        const brakeFactor = Math.pow(distToStop / 300, 1.8);
+                        targetSpeed = c.baseSpeed * brakeFactor;
+                        targetSpeed = Math.max(targetSpeed, 0.02);
+                        if (distToStop < 3) targetSpeed = 0;
+                    }
+                }
+
+                let leaderDist = Infinity;
+                for (const o of cars) {
+                    if (o === c || o.lane !== c.lane) continue;
+                    let d;
+                    if (c.dir === 1 && o.x > c.x) {
+                        d = (o.x - o.w / 2) - (c.x + c.w / 2);
+                        if (d < leaderDist) leaderDist = d;
+                    }
+                    if (c.dir === -1 && o.x < c.x) {
+                        d = (c.x - c.w / 2) - (o.x + o.w / 2);
+                        if (d < leaderDist) leaderDist = d;
+                    }
+                }
+                if (leaderDist < 45) {
+                    const followSpeed = Math.max(0, leaderDist * 0.04);
+                    targetSpeed = Math.min(targetSpeed, followSpeed);
+                }
+
+                if (tlState === 'green') c.passedStop = false;
+
+                const smoothing = targetSpeed < c.speed ? 0.05 : 0.03;
+                c.speed += (targetSpeed - c.speed) * smoothing;
+                if (c.speed < 0.015) c.speed = 0;
+                c.x += c.dir * c.speed;
+            }
+
+            for (let i = cars.length - 1; i >= 0; i--) {
+                if (cars[i].x > W + 80 || cars[i].x < -80) cars.splice(i, 1);
+            }
+        }
+
+        // --- Drawing ---
+
+        let pedWalkOffset = 0;
+
+        function drawScene() {
+            if (btnPressTimer > 0) btnPressTimer--;
+
+            ctx.clearRect(0, 0, W, H);
+
+            ctx.fillStyle = sandC;
+            ctx.fillRect(0, 0, W, H);
+
+            ctx.fillStyle = sandC2;
+            for (let i = 0; i < 18; i++) {
+                const dx = (i * 137.5) % W;
+                const dy = (i * 89.3) % H;
+                ctx.globalAlpha = 0.3;
+                ctx.beginPath();
+                ctx.arc(dx, dy, 2 + (i % 3), 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.globalAlpha = 1;
+
+            ctx.fillStyle = sideC;
+            ctx.fillRect(0, roadY - roadW / 2 - 5, W, roadW + 10);
+            ctx.fillStyle = roadC;
+            ctx.fillRect(0, roadY - roadW / 2, W, roadW);
+
+            ctx.setLineDash([16, 16]);
+            ctx.strokeStyle = dk ? '#555' : '#999';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(0, roadY);
+            ctx.lineTo(stopL - 10, roadY);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(stopR + 10, roadY);
+            ctx.lineTo(W, roadY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.fillStyle = dk ? '#777' : '#ddd';
+            ctx.globalAlpha = 0.45;
+            const stripeW = 7, stripeGap = 5, stripeCount = 8;
+            const totalCW = stripeCount * (stripeW + stripeGap) - stripeGap;
+            const cwStart = crossX - totalCW / 2;
+            for (let i = 0; i < stripeCount; i++) {
+                ctx.fillRect(cwStart + i * (stripeW + stripeGap), roadY - roadW / 2 + 3, stripeW, roadW - 6);
+            }
+            ctx.globalAlpha = 1;
+
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2.5;
+            ctx.globalAlpha = tlState === 'green' ? 0.12 : 0.7;
+            ctx.beginPath();
+            ctx.moveTo(stopL, roadY - roadW / 2 + 2);
+            ctx.lineTo(stopL, roadY - 1);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(stopR, roadY + 1);
+            ctx.lineTo(stopR, roadY + roadW / 2 - 2);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+
+            for (const c of cars) {
+                ctx.fillStyle = c.color;
+                ctx.beginPath();
+                ctx.roundRect(c.x - c.w / 2, c.y - c.h / 2, c.w, c.h, 3);
+                ctx.fill();
+                ctx.fillStyle = dk ? 'rgba(200,220,255,0.25)' : 'rgba(200,220,255,0.5)';
+                const frontX = c.dir === 1 ? c.x + c.w / 2 - 10 : c.x - c.w / 2 + 2;
+                ctx.fillRect(frontX, c.y - c.h / 2 + 2, 8, 3);
+                ctx.fillRect(frontX, c.y + c.h / 2 - 5, 8, 3);
+                if (c.speed < 0.2 && tlState !== 'green') {
+                    ctx.fillStyle = '#ef4444';
+                    ctx.globalAlpha = 0.85;
+                    const tailX = c.dir === 1 ? c.x - c.w / 2 : c.x + c.w / 2 - 4;
+                    ctx.fillRect(tailX, c.y - c.h / 2 + 2, 4, 3);
+                    ctx.fillRect(tailX, c.y + c.h / 2 - 5, 4, 3);
+                    ctx.globalAlpha = 1;
+                }
+            }
+
+            if (pedState === 'green') {
+                pedWalkOffset += 0.5;
+                ctx.globalAlpha = 0.6;
+                for (let i = 0; i < 3; i++) {
+                    const startY = roadY + roadW / 2 - 6;
+                    const py = startY - pedWalkOffset - i * 22;
+                    if (py < roadY - roadW / 2 - 10) continue;
+                    const px = crossX - 10 + i * 10;
+                    ctx.fillStyle = txtC;
+                    ctx.beginPath();
+                    ctx.arc(px, py - 6, 3.5, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.fillRect(px - 1.5, py - 2, 3, 8);
+                    const legOff = Math.sin(Date.now() / 150 + i * 2) * 3;
+                    ctx.fillRect(px - 4, py + 6, 3, 5 + legOff);
+                    ctx.fillRect(px + 1, py + 6, 3, 5 - legOff);
+                }
+                ctx.globalAlpha = 1;
+                if (pedWalkOffset > roadW + 30) pedWalkOffset = 0;
+            } else {
+                pedWalkOffset = 0;
+            }
+
+            const tlX = stopL - 22, tlY = roadY - roadW / 2 - 16;
+            ctx.fillStyle = '#1a1a1a';
+            ctx.beginPath();
+            ctx.roundRect(tlX - 12, tlY - 28, 24, 56, 5);
+            ctx.fill();
+            ctx.strokeStyle = dk ? '#444' : '#333';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ['red', 'yellow', 'green'].forEach((c, i) => {
+                const cy2 = tlY - 17 + i * 17;
+                ctx.beginPath();
+                ctx.arc(tlX, cy2, 6, 0, Math.PI * 2);
+                if (c === tlState) {
+                    ctx.fillStyle = gc(c);
+                    ctx.shadowColor = gc(c);
+                    ctx.shadowBlur = 12;
+                } else {
+                    ctx.fillStyle = dk ? '#282828' : '#2a2a2a';
+                    ctx.shadowBlur = 0;
+                }
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            });
+
+            const pedPX = crossX + totalCW / 2 + 20, pedPY = roadY + roadW / 2 + 20;
+            ctx.fillStyle = '#1a1a1a';
+            ctx.beginPath();
+            ctx.roundRect(pedPX - 10, pedPY - 17, 20, 34, 4);
+            ctx.fill();
+            ctx.strokeStyle = dk ? '#444' : '#333';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ['red', 'green'].forEach((c, i) => {
+                const cy2 = pedPY - 7 + i * 14;
+                ctx.beginPath();
+                ctx.arc(pedPX, cy2, 5, 0, Math.PI * 2);
+                ctx.fillStyle = c === pedState ? gc(c) : (dk ? '#282828' : '#2a2a2a');
+                if (c === pedState) { ctx.shadowColor = gc(c); ctx.shadowBlur = 8; }
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            });
+
+            // Physical button indicator
+            const btnX = crossX - totalCW / 2 - 20, btnY = roadY + roadW / 2 + 20;
+            const isActive = btnPressTimer > 0;
+            const btnScale = btnPressTimer > 12 ? 0.8 : 1;
+            const btnR = 9 * btnScale;
+
+            if (isActive) {
+                ctx.globalAlpha = 0.3 + Math.sin(Date.now() / 200) * 0.15;
+                ctx.fillStyle = '#ef4444';
+                ctx.beginPath();
+                ctx.arc(btnX, btnY, 15, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.globalAlpha = 1;
+            }
+
+            ctx.fillStyle = isActive ? '#dc2626' : (dk ? '#666' : '#f59e0b');
+            ctx.beginPath();
+            ctx.arc(btnX, btnY, btnR, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = isActive ? '#7f1d1d' : (dk ? '#888' : '#92400e');
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            if (isActive) {
+                ctx.fillStyle = '#fff';
+                ctx.globalAlpha = 0.9;
+                ctx.beginPath();
+                ctx.arc(btnX, btnY, 3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.globalAlpha = 1;
+            }
+
+            ctx.fillStyle = txtC;
+            ctx.font = '9px system-ui';
+            ctx.textAlign = 'center';
+            ctx.fillText('BTN', btnX, btnY + 22);
+
+            ctx.fillStyle = txtC;
+            ctx.font = '11px system-ui';
+            ctx.globalAlpha = 0.35;
+            ctx.textAlign = 'left';
+            ctx.fillText('← west', 10, H - 14);
+            ctx.textAlign = 'right';
+            ctx.fillText('east →', W - 10, H - 14);
+            ctx.globalAlpha = 1;
+        }
+
+        function loop() {
+            updateCars();
+            drawScene();
+            requestAnimationFrame(loop);
+        }
+        loop();
+    </script>
+</body>
+
+</html>
