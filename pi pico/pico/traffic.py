@@ -1,3 +1,23 @@
+"""Traffic light state machine. Imported by main.py -- copy both to the board.
+
+One class covers both roles, chosen by `kind`:
+
+    "normal"      GREEN -> YELLOW -> RED, looping on a timer.
+    "pedestrian"  sits at PED_RED until asked, then PED_GREEN and back.
+
+The two coordinate through a single shared `uasyncio.Event` (`ped_request`):
+
+    button press  ->  ped_request.set() + normal.interrupt()
+    interrupt()   ->  cuts the normal light's current _sleep() short so it
+                      advances to RED immediately instead of waiting out
+                      the full 10s
+    pedestrian    ->  wakes on the event, runs its sequence, then clears it,
+                      which releases the normal light back into its loop
+
+_sleep() polls a flag every 100ms rather than using a real cancellable timer;
+that is the whole reason interrupt() works without task cancellation.
+"""
+
 import machine
 import uasyncio
 
