@@ -9,7 +9,6 @@ so it is Pin("LED"). Pin(25) is the WiFi chip select on this board -- it
 compiles and runs fine, it just never lights anything. That is the usual
 reason a working plain-Pico blink does nothing on a Pico W.
 
-No external wiring needed. USB cable only.
 """
 
 import machine

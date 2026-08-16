@@ -237,6 +237,14 @@ host↔board link before debugging anything else.
 uv run mpremote run "pi pico/picoW/main.py"
 ```
 
+[servo_test.py](pi%20pico/picoW/servo_test.py) sweeps a hobby servo on GP15 —
+wiring notes and the pulse-width maths are in its header. Power the servo from
+**VBUS, never 3V3**.
+
+```bash
+uv run mpremote run "pi pico/picoW/servo_test.py"
+```
+
 ---
 
 ## Reference
