@@ -2,6 +2,8 @@
 
 Board:  Raspberry Pi Pico W (RP2040, 2022).
 Run:    uv run mpremote run "pi pico/picoW/main.py"
+Or via the Pi the Pico is plugged into (see README section 5):
+        scp "pi pico/picoW/main.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/main.py'
         See ../../README.md for the full flash/connect/push flow.
 
 On a Pico W the onboard LED is wired to the CYW43 WiFi chip, not to a GPIO,

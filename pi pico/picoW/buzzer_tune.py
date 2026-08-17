@@ -2,6 +2,8 @@
 
 Board:  Raspberry Pi Pico W (RP2040, 2022).
 Run:    uv run mpremote run "pi pico/picoW/buzzer_tune.py"
+Or via the Pi the Pico is plugged into (see README section 5):
+        scp "pi pico/picoW/buzzer_tune.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/buzzer_tune.py'
 Wiring: see buzzer_test.py. GP16 via a series resistor.
 
 WHY THIS EXISTS

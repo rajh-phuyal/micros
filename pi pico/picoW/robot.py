@@ -2,6 +2,8 @@
 
 Board:  Raspberry Pi Pico W (RP2040, 2022).
 Run:    uv run mpremote run "pi pico/picoW/robot.py"
+Or via the Pi the Pico is plugged into (see README section 5):
+        scp "pi pico/picoW/robot.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/robot.py'
 Install so it runs on its own from a USB power bank, no laptop:
         uv run mpremote cp "pi pico/picoW/robot.py" :main.py
         uv run mpremote reset
@@ -13,15 +15,56 @@ individual test scripts; run those first if a part misbehaves.
     HC-SR04 TRIG    ->  GP2                  physical pin 4    ultrasonic_test.py
     HC-SR04 ECHO    ->  1k/2k divider -> GP3 physical pin 5    ultrasonic_test.py
     buzzer signal   ->  330R -> GP16         physical pin 21   buzzer_test.py
+    LED strip DIN   ->  330R -> GP18         physical pin 24   led_test.py
 
-    all three V+    ->  VBUS                 physical pin 40   (5V)
-    all three GND   ->  GND rail -> GND      physical pin 38
+    HC-SR04 V+      ->  VBUS                 physical pin 40   (5V)
+    servo V+        ->  VBUS  -- read the power section below
+    LED strip +5    ->  VBUS
+    all GND         ->  GND rail -> GND      physical pin 38
 
     (a 3-pin buzzer module's middle pin goes to 3V3, physical pin 36)
+    (the strip is one-way -- use the end marked DIN, never DO)
 
 Everything must share a ground with the Pico or none of the signals have a
 reference. The buzzer is happy on 3V3 or straight off the GPIO; the servo and
-the HC-SR04 both genuinely need 5V, so VBUS.
+the HC-SR04 both genuinely need 5V.
+
+POWER -- EVERYTHING SHARES VBUS, AND IT MEASURABLY FITS
+
+On a Raspberry Pi 5 the USB port allows 600mA TOTAL for the whole board.
+Measured draw:
+
+    Pico W                      ~40mA
+    HC-SR04                     ~15mA
+    buzzer                       ~9mA   while sounding
+    SG90 servo                 ~200mA   eased in 1 degree steps
+                              700mA-1A  commanded to move flat out
+    8 x WS2812B                  50mA   held there by the software limiter
+                                488mA   if that limiter were removed
+
+power_test.py escalates all four peripherals together -- including this file's
+genuine worst case, the be_startled flinch -- and the kernel log comes back
+empty. So this combination is verified rather than assumed.
+
+WHAT MAKES IT FIT IS THE EASING, AND THAT IS NOT A COINCIDENCE
+
+servo_test.py FAILS on this same rail. It commands whole-travel steps, so the
+motor goes flat out, the port's limiter trips, and you get `over-current
+change` then `USB disconnect` in the kernel log and a bare `OSError: [Errno 5]
+Input/output error` on the host -- which looks nothing like a power fault.
+
+This file never does that. Every move is eased in ~1 degree increments, so the
+motor never reaches full speed and therefore never reaches full current. The
+easing was added to stop a light base tipping over; it turns out to be
+load-bearing for power as well. Do NOT replace glide() with _write().
+
+If you add anything else to this rail, re-run power_test.py rather than
+trusting the arithmetic above -- a 600mA limiter reacts to peaks, not averages.
+
+If you ever do get a second 5V source (any USB phone charger plus a USB-A
+breakout will do), give it to the servo and the strip, tie its ground to a Pico
+GND, and leave VBUS out of it. Then STRIP_MA can go up and the servo stops
+being the constraint. Grounds MUST stay common or no signal has a reference.
 
 A two-pin passive buzzer has no polarity that matters -- a square wave
 reversed is the same square wave. The 330R does matter though: this buzzer
@@ -54,17 +97,41 @@ not set it off repeatedly -- it has to lose you first.
 
 MOODS, roughly in order of how much you are bothering it:
 
-    holding     watching something that is staying put -- silent, still
-    curious     it moved; a short rising blip
-    wary        it is closing in; two hesitant rising notes
-    shy         inside CLOSE_CM; squeaks and leans away
-    startled    something is in its FACE; bolts sideways and squeals
-    annoyed     still there after being told twice; grumbles and shakes head
-    sulky       still there after six; turns away, goes dark, ignores you
-    sad         lost them
-    bored       nothing around at all
+    holding     watching something that is staying put -- silent, still  green
+    curious     it moved; a short rising blip                            green
+    wary        it is closing in; two hesitant rising notes              amber
+    shy         inside CLOSE_CM; squeaks and leans away                  amber
+    startled    something is in its FACE; bolts sideways and squeals     red
+    annoyed     still there after being told twice; grumbles, shakes     red
+    sulky       still there after six; turns away, light drains, ignores blue
+    sad         lost them                                                blue
+    bored       nothing around at all                                    white
 
 Backing off resets the escalation -- one clean reading clears `blocked`.
+
+LIGHTS
+
+The 8-pixel strip is a second channel of expression, and also a readout. While
+scanning or patrolling, strip.head() lights the pixel matching the servo's
+bearing with its neighbours dimmer, so you can see where the robot is looking
+without watching the head. Amber while searching, green once it has something.
+
+Colour is chosen by mood, not by state machine: each mood function sets the
+strip on entry and leaves it in the correct resting colour on exit, exactly as
+each one already leaves the head on target. Nothing in the main loop paints.
+
+Every frame goes through a CURRENT LIMITER (see Strip). It estimates a frame's
+draw before sending it and scales the whole frame down if it would exceed
+STRIP_MA, which is what lets the strip share VBUS with the servo. Scaling the
+whole frame rather than each pixel preserves relative brightness, so hues and
+gradients survive -- they just get dimmer.
+
+Animations are only used where a pause already existed to spend. be_sulky's
+drain consumes the sulk instead of adding to it, and be_bored's breathe
+replaces its trailing pause. Inside tight sequences -- the startle, the
+grumble, the greeting waggle -- the strip is only ever set instantly, because
+a frame costs ~0.3ms and must not disturb the servo's 20ms frame or the
+sensor's echo timing.
 
 MOVEMENT. Every move is eased, not commanded as a step. A servo has no speed
 input, so a single big write makes it slam across and ring on arrival; glide()
@@ -89,10 +156,20 @@ WHAT THIS CANNOT DO -- worth knowing before blaming the code:
 import machine
 import time
 
+try:
+    import neopixel
+except ImportError:
+    raise SystemExit(
+        "no `neopixel` module in this firmware.\n"
+        "Flash a current MicroPython build for the Pico W -- see README\n"
+        "section 1. Every official build since 1.20 ships it."
+    )
+
 SERVO_PIN = 15
 TRIG_PIN = 2
 ECHO_PIN = 3
 BUZZER_PIN = 16
+LED_PIN = 18
 
 # --- servo -----------------------------------------------------------------
 SERVO_FREQ = 50
@@ -191,6 +268,49 @@ PATROL_PING_MS = 80   # >=60ms of quiet between pings still applies while moving
 # --- sensor ----------------------------------------------------------------
 CM_PER_US = 0.0343
 TIMEOUT_US = 30_000
+
+# --- lights ----------------------------------------------------------------
+PIXELS = 8
+
+# The strip's share of the 600mA USB budget. Lower than the 80mA that
+# led_test.py proved safe, because that figure was measured with the strip
+# ALONE and the servo needs its glide current back. 50mA is what power_test.py
+# verified with everything running at once.
+#
+# This is the single knob for strip brightness. Raise it in ~20mA steps and
+# re-run power_test.py with the kernel log each time -- do not just turn it up
+# and hope, because the failure mode is the Pico dropping off USB mid-move.
+STRIP_MA = 50
+
+# A WS2812B is three ~20mA LEDs plus a controller that draws ~1mA even dark.
+# Datasheets say 20mA/channel and real parts come in slightly under, so this
+# errs high, which is the safe direction for a budget.
+MA_PER_CHANNEL = 20
+QUIESCENT_MA = 1
+
+OFF = (0, 0, 0)
+AMBER = (255, 120, 0)     # looking, wary, shy -- attention without alarm
+GREEN = (0, 255, 60)      # found you, holding, curious
+RED = (255, 0, 0)         # startled, annoyed
+BLUE = (0, 60, 255)       # sulking, sad
+WHITE = (255, 255, 255)   # waking, bored
+
+
+def dim(colour, f):
+    """Scale a colour by f.
+
+    Used to pick resting levels comfortably under the current ceiling. That
+    matters: a colour that would trip the limiter comes out scaled by the
+    limiter instead, and while that preserves hue it makes the brightness of a
+    resting state depend on STRIP_MA rather than on intent.
+    """
+    return (int(colour[0] * f), int(colour[1] * f), int(colour[2] * f))
+
+
+# What the strip settles to between events. Deliberately dim: these are on
+# almost all the time, so they set the robot's idle draw and its idle mood.
+RESTING_SEARCH = dim(AMBER, 0.35)
+RESTING_HOLD = dim(GREEN, 0.3)
 
 # --- personality -----------------------------------------------------------
 # duty_u16. 32768 is a 50% square wave, which is as loud as a passive buzzer
@@ -331,13 +451,117 @@ class Buzzer:
         self.pwm.deinit()
 
 
+class Strip:
+    """8 addressable pixels with a hard current ceiling.
+
+    The limiter is the only reason this can share VBUS with a servo. Every
+    frame's draw is estimated BEFORE it is sent -- three ~20mA channels plus
+    ~1mA of controller per pixel -- and the whole frame is scaled down if it
+    would exceed STRIP_MA. Verified against hand arithmetic in led_test.py:
+    eight pixels of full white asks for 488mA and arrives as 15% of requested.
+
+    Scaling the frame as a whole rather than pixel by pixel is deliberate. It
+    preserves the ratios between pixels and between channels, so a gradient
+    stays a gradient and a hue stays that hue -- it simply gets dimmer. A
+    per-pixel clamp would distort both.
+
+    Note there is NO WAY TO DETECT the strip. WS2812B is write-only with no
+    return path, so NeoPixel() succeeds whether or not anything is plugged in
+    and a missing strip is indistinguishable from a working one in software.
+    Nothing here can warn you; use led_test.py.
+    """
+
+    def __init__(self, pin, n):
+        self.np = neopixel.NeoPixel(machine.Pin(pin), n)
+        self.n = n
+
+    def estimate_ma(self, frame):
+        channels = sum(sum(px) for px in frame)
+        return self.n * QUIESCENT_MA + channels * MA_PER_CHANNEL / 255
+
+    def show(self, frame):
+        # Only the controllable part is scaled -- quiescent draw cannot be
+        # reduced by dimming, so including it in the ratio would over-scale.
+        budget = STRIP_MA - self.n * QUIESCENT_MA
+        wanted = self.estimate_ma(frame) - self.n * QUIESCENT_MA
+        scale = budget / wanted if wanted > budget and wanted > 0 else 1.0
+        for i, px in enumerate(frame):
+            self.np[i] = (int(px[0] * scale),
+                          int(px[1] * scale),
+                          int(px[2] * scale))
+        self.np.write()
+
+    def fill(self, colour):
+        self.show([colour] * self.n)
+
+    def clear(self):
+        self.fill(OFF)
+
+    def bar(self, colour, lit):
+        """The first `lit` pixels on. A level readout."""
+        self.show([colour if i < lit else OFF for i in range(self.n)])
+
+    def head(self, deg, colour):
+        """Light the pixel matching a head bearing, with neighbours dimmer.
+
+        Turns the strip into a position indicator -- you can see where the
+        robot is looking without watching the servo. One frame costs ~0.3ms,
+        far too short to disturb the servo's 20ms frame or time_pulse_us, so
+        this drops into scanning and patrol without a timing cost.
+        """
+        span = SCAN_MAX_DEG - SCAN_MIN_DEG
+        pos = int((deg - SCAN_MIN_DEG) * (self.n - 1) / span)
+        pos = max(0, min(self.n - 1, pos))
+        frame = []
+        for i in range(self.n):
+            gap = abs(i - pos)
+            frame.append(colour if gap == 0 else
+                         dim(colour, 0.25) if gap == 1 else OFF)
+        self.show(frame)
+
+    def wipe(self, colour, ms):
+        """Fill one pixel at a time. BLOCKING -- only for moments that already
+        have a pause to spend, never inside a timed sequence."""
+        step = max(1, ms // self.n)
+        for lit in range(1, self.n + 1):
+            self.bar(colour, lit)
+            time.sleep_ms(step)
+
+    def drain(self, colour, ms):
+        """Lose one pixel at a time until dark, over ms.
+
+        The sulk. The light going out slowly IS the sulk, so this consumes the
+        sulk duration rather than adding to it -- it replaces the pause that
+        used to sit there doing nothing.
+        """
+        step = max(1, ms // (self.n + 1))
+        for lit in range(self.n, -1, -1):
+            self.bar(colour, lit)
+            time.sleep_ms(step)
+
+    def breathe(self, colour, ms, cycles=1):
+        """Slow fade up and down -- the bored sigh, made visible."""
+        steps = 12
+        step = max(1, ms // (cycles * steps * 2))
+        for _ in range(cycles):
+            for i in list(range(steps + 1)) + list(range(steps - 1, -1, -1)):
+                self.fill(dim(colour, i / steps))
+                time.sleep_ms(step)
+
+
 led = machine.Pin("LED", machine.Pin.OUT)
 led.value(1)          # lit means powered and running -- the liveness check
 
 servo = Servo(SERVO_PIN)
 buzzer = Buzzer(BUZZER_PIN)
+strip = Strip(LED_PIN, PIXELS)
 trig = machine.Pin(TRIG_PIN, machine.Pin.OUT)
 echo = machine.Pin(ECHO_PIN, machine.Pin.IN)
+
+# What colour the head-position indicator uses. Amber while hunting, green once
+# it has something. In a list so measure() and the patrol watch can both read
+# the current value without a global statement -- same idiom as _last_ping_ms.
+look_colour = [AMBER]
 
 
 # --- sensing ---------------------------------------------------------------
@@ -364,6 +588,7 @@ def measure(deg, samples):
     reflection without chasing them in code.
     """
     servo.glide(deg)
+    strip.head(deg, look_colour[0])   # ~0.3ms; shows where it is pointing
     time.sleep_ms(SETTLE_MS)
 
     reads = []
@@ -409,13 +634,18 @@ def greet(deg):
     cheerful rather than as four beeps.
     """
     servo.glide(deg)
-    time.sleep_ms(300)
+    strip.wipe(GREEN, 200)    # spends the pause that used to be sleep_ms(300)
+    time.sleep_ms(100)
 
-    for offset, ratio in ((WIGGLE_DEG, 0.667),       # root
-                          (-WIGGLE_DEG, 0.833),      # third
-                          (WIGGLE_DEG // 2, 1.0),    # fifth, on the peak
-                          (0, 1.125)):               # a step above
+    notes = ((WIGGLE_DEG, 0.667),       # root
+             (-WIGGLE_DEG, 0.833),      # third
+             (WIGGLE_DEG // 2, 1.0),    # fifth, on the peak
+             (0, 1.125))                # a step above
+    for i, (offset, ratio) in enumerate(notes):
         buzzer.start(pitch(ratio))
+        # A bar rising under the rising triad. Set instantly, so the note, the
+        # movement and the light all begin together.
+        strip.bar(GREEN, (i + 1) * PIXELS // len(notes))
         servo.glide(deg + offset, WIGGLE_DEG_PER_S)
         led.toggle()
         time.sleep_ms(WIGGLE_MS)
@@ -423,30 +653,49 @@ def greet(deg):
     buzzer.stop()
     led.value(1)
     buzzer.slide(pitch(1.125), pitch(1.33), 140)   # a little flourish on the end
+    strip.fill(RESTING_HOLD)
 
 
 def be_shy(deg):
-    """Crowded. Lean away, squeak, then peek back."""
+    """Crowded. Lean away, squeak, then peek back.
+
+    The light shrinks back as the head does and returns as it peeks, so the
+    lean reads as flinching rather than as merely turning.
+    """
+    strip.fill(AMBER)
     buzzer.slide(pitch(1.0), pitch(1.3), 100)
     away = deg + SHY_DEG if deg < CENTRE_DEG else deg - SHY_DEG
+    strip.fill(dim(AMBER, 0.25))
     servo.glide(away, WIGGLE_DEG_PER_S)
     time.sleep_ms(250)
     buzzer.slide(pitch(1.3), pitch(1.0), 100)
+    strip.fill(AMBER)
     servo.glide(deg)
     time.sleep_ms(200)
+    strip.fill(RESTING_HOLD)
 
 
 def be_curious():
     """Small interested blip when the target has shifted. Rises through the
     peak, so it is short but cuts through."""
+    strip.fill(GREEN)
     buzzer.slide(pitch(0.8), pitch(1.1), 90)
+    strip.fill(RESTING_HOLD)
 
 
 def be_wary():
-    """You are closing in. Two hesitant rising notes -- not alarmed yet."""
+    """You are closing in. Two hesitant rising notes -- not alarmed yet.
+
+    The strip brightens with each note and falls back between them, which is
+    what makes two notes read as hesitation rather than as a two-note tune.
+    """
+    strip.fill(AMBER)
     buzzer.tone(pitch(0.7), 70)
+    strip.fill(dim(AMBER, 0.2))
     time.sleep_ms(60)
+    strip.fill(AMBER)
     buzzer.tone(pitch(0.85), 70)
+    strip.fill(RESTING_HOLD)
 
 
 def be_startled(deg):
@@ -459,14 +708,20 @@ def be_startled(deg):
     reads as alarm without needing a violent movement to sell it.
     """
     away = deg + FLINCH_DEG if deg < CENTRE_DEG else deg - FLINCH_DEG
+    # Red lands before the movement, same as the squeal. Set instantly -- this
+    # is the tightest sequence in the file and must not gain any latency.
+    strip.fill(RED)
     buzzer.start(pitch(1.45))
     servo.glide(away, FLINCH_DEG_PER_S)
     for i in range(3):
         buzzer.start(pitch(1.5 if i % 2 == 0 else 1.15))
+        strip.fill(RED if i % 2 == 0 else OFF)   # hard blink, on the chirps
         time.sleep_ms(55)
     buzzer.stop()
+    strip.fill(RED)
     time.sleep_ms(250)
     servo.glide(deg)
+    strip.fill(RESTING_HOLD)
 
 
 def be_annoyed(deg):
@@ -480,42 +735,62 @@ def be_annoyed(deg):
     """
     for i in range(6):
         buzzer.start(pitch(1.05 if i % 2 else 0.95))
+        strip.fill(RED if i % 2 else dim(RED, 0.15))   # grumbles in light too
         servo.glide(deg + (SHAKE_DEG if i % 2 else -SHAKE_DEG), SHAKE_DEG_PER_S)
         time.sleep_ms(45)
     buzzer.stop()
     servo.glide(deg)
+    strip.fill(RESTING_HOLD)
 
 
 def be_sulky(deg):
-    """Given up on you. Turn pointedly away, go dark, and ignore the room."""
+    """Given up on you. Turn pointedly away, go dark, and ignore the room.
+
+    drain() replaces the bare SULK_MS pause rather than adding to it, so the
+    sulk lasts exactly as long as it always did -- the light now goes out over
+    the course of it, one pixel at a time, which is the whole mood in one
+    gesture.
+    """
     buzzer.slide(pitch(1.0), pitch(0.5), 500)
     away = SCAN_MIN_DEG if deg > CENTRE_DEG else SCAN_MAX_DEG
+    strip.fill(dim(BLUE, 0.5))
     servo.glide(away, SULK_DEG_PER_S)
     led.value(0)
-    time.sleep_ms(SULK_MS)
+    strip.drain(BLUE, SULK_MS)
     led.value(1)
+    strip.fill(RESTING_SEARCH)
 
 
 def be_sad():
     """Lost them. Falling away from resonance fades it out on its own, which
     is exactly the shape a disappointed noise wants."""
+    strip.fill(dim(BLUE, 0.6))
     buzzer.play(((pitch(1.0), 130), (pitch(0.667), 260)))
+    strip.fill(RESTING_SEARCH)
 
 
 def be_bored():
-    """Nothing around for a while. Sigh, and have a look at the ceiling."""
+    """Nothing around for a while. Sigh, and have a look at the ceiling.
+
+    breathe() spends the trailing 500ms that was already a plain pause, so the
+    sigh costs no extra time -- it just stops being invisible.
+    """
+    strip.fill(dim(WHITE, 0.3))
     buzzer.slide(pitch(1.0), pitch(0.55), 350)
     servo.glide(CENTRE_DEG)
-    time.sleep_ms(500)
+    strip.breathe(WHITE, 500)
+    strip.fill(RESTING_SEARCH)
 
 
 def wake():
     """Startup: centre the head and announce itself. Starts well below
     resonance and climbs onto it, so it swells as it rises -- a power-up."""
     servo.snap(CENTRE_DEG)
-    time.sleep_ms(400)
+    strip.wipe(dim(WHITE, 0.6), 240)   # fills from one end, like booting up
+    time.sleep_ms(200)
     buzzer.slide(pitch(0.4), pitch(1.0), 260)
     buzzer.tone(pitch(1.125), 90)
+    strip.fill(RESTING_SEARCH)
 
 
 # --- patrol ----------------------------------------------------------------
@@ -528,6 +803,11 @@ _last_ping_ms = [0]
 
 def _patrol_watch():
     """Called between glide steps. Returns (deg, cm) on a hint, else None."""
+    # Track the head on the strip every step, not just on ping cycles -- the
+    # point of the patrol is looking alive, and a smoothly travelling light is
+    # most of that. ~150 steps across an arc at ~0.3ms each is ~45ms total.
+    strip.head(servo.current, look_colour[0])
+
     now = time.ticks_ms()
     if time.ticks_diff(now, _last_ping_ms[0]) < PATROL_PING_MS:
         return None
@@ -630,6 +910,11 @@ try:
 
     while True:
         if searching:
+            # Amber while hunting. Set here rather than once on entry because
+            # the searching branch is also re-entered after a sulk or a lost
+            # target, and this is the one place all those paths pass through.
+            look_colour[0] = AMBER
+
             # One sample per point: a full arc is 11 points and 3 pings each
             # makes the search sluggish. Fliers get corrected by the fine
             # sweep that follows a hit.
@@ -652,6 +937,7 @@ try:
             heading, last_cm = deg, cm
             searching, lost, empty_sweeps = False, 0, 0
             blocked = 0
+            look_colour[0] = GREEN   # it has something now
             print("hello!  %3d deg  %5.0f cm" % (heading, cm))
             greet(heading)
             continue   # greet already left the head on target
@@ -761,8 +1047,13 @@ finally:
             time.sleep_ms(300)
             buzzer.release()
             servo.release()
+            # The strip is not a peripheral that keeps running -- each pixel
+            # latches its last frame and holds it indefinitely with no further
+            # input. So an uncleared strip stays lit forever after exit, which
+            # looks even more like Ctrl-C was ignored than a droning buzzer.
+            strip.clear()
             led.value(0)
             break
         except KeyboardInterrupt:
             pass
-    print("released -- head centred and limp, buzzer quiet, led off")
+    print("released -- head centred and limp, buzzer quiet, pixels off")

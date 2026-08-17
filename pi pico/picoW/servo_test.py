@@ -2,20 +2,33 @@
 
 Board:  Raspberry Pi Pico W (RP2040, 2022).
 Run:    uv run mpremote run "pi pico/picoW/servo_test.py"
+Or via the Pi the Pico is plugged into (see README section 5):
+        scp "pi pico/picoW/servo_test.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/servo_test.py'
         See ../../README.md for the full flash/connect/push flow.
 
 WIRING -- read before plugging in:
 
     servo signal (orange/yellow)  ->  GP15   physical pin 20
-    servo V+     (red)            ->  VBUS   physical pin 40   (5V from USB)
-    servo GND    (brown/black)    ->  GND    physical pin 38
+    servo V+     (red)            ->  its own 5V supply, NOT the Pico
+    servo GND    (brown/black)    ->  that supply's GND *and* GND pin 38
 
 Do NOT power the servo from 3V3 (physical pin 36). That rail is a small
 regulator for the RP2040 itself -- a servo's stall current will brown it out
-and reset the board mid-move. VBUS is acceptable for a single unloaded SG90.
-Anything larger, or more than one servo, needs its own 5-6V supply with its
-GND tied back to a Pico GND pin (they must share a ground or the signal has
-no reference).
+and reset the board mid-move.
+
+VBUS (physical pin 40) is tempting and often *seems* to work, but it is the
+USB rail, and an SG90 pulls 700mA-1A on inrush. Measured on a Raspberry Pi 5,
+which caps USB at 600mA total unless its firmware trusts the supply, the very
+first move triggers `over-current`, the Pico disconnects and re-enumerates, and
+the host reports `OSError: [Errno 5] Input/output error` from inside mpremote --
+which looks nothing like a power fault. A laptop port has more headroom and
+hides this for longer, which is worse: it fails later, under load, intermittently.
+
+So give the servo its own 5-6V supply -- power bank, 4xAA, bench supply -- with
+its GND tied back to a Pico GND pin. They MUST share a ground: the pulse width
+is measured against it, so without the link the servo ignores the signal
+entirely. Do not connect the external 5V to VBUS as well. A 470-1000uF
+capacitor across the servo supply absorbs the inrush.
 
 GP15's logic high is 3.3V, technically under spec for a 5V servo, but the
 common SG90/MG90 clones accept it. If the servo twitches or ignores you and

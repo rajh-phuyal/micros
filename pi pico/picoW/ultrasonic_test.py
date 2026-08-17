@@ -2,6 +2,8 @@
 
 Board:  Raspberry Pi Pico W (RP2040, 2022).
 Run:    uv run mpremote run "pi pico/picoW/ultrasonic_test.py"
+Or via the Pi the Pico is plugged into (see README section 5):
+        scp "pi pico/picoW/ultrasonic_test.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/ultrasonic_test.py'
         See ../../README.md for the full flash/connect/push flow.
 
 WIRING:

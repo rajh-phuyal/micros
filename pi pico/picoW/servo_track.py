@@ -2,6 +2,8 @@
 
 Board:  Raspberry Pi Pico W (RP2040, 2022).
 Run:    uv run mpremote run "pi pico/picoW/servo_track.py"
+Or via the Pi the Pico is plugged into (see README section 5):
+        scp "pi pico/picoW/servo_track.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/servo_track.py'
         See ../../README.md for the full flash/connect/push flow.
 
 Hardware (wiring detail lives in servo_test.py and ultrasonic_test.py):

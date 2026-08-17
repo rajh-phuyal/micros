@@ -150,12 +150,136 @@ uv run mpremote repl
 Ctrl-C breaks into the running program, Ctrl-D soft-reboots (re-runs `main.py`),
 **Ctrl-]** exits the repl and leaves the board running.
 
+### 5. Driving the board through a Raspberry Pi over SSH
+
+When the Pico is plugged into a Pi rather than the laptop. Here the Pi is
+`my-pi`, reachable over Tailscale — MagicDNS resolves the name, so no
+`~/.ssh/config` entry and no IP address to remember.
+
+**`mpremote` must run on the Pi.** It opens `/dev/ttyACM0` directly, so it has to
+live on the machine the USB cable is plugged into. There is no way to drive the
+Pico's serial port from the laptop short of forwarding the serial device over
+the network, which is more moving parts than this earns.
+
+**The repo stays on the laptop.** Only the one script being tested gets pushed.
+That keeps a single source of truth under git, keeps normal editing tools
+working, and means nothing has to be committed just to test it.
+
+#### One-time setup on the Pi
+
+```bash
+ssh my-pi 'curl -LsSf https://astral.sh/uv/install.sh | sh && ~/.local/bin/uv tool install mpremote'
+```
+
+Then add `~/.local/bin` to `PATH` **in `~/.zshenv`**, not `~/.zshrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+That distinction is the whole reason `ssh my-pi 'mpremote ...'` fails with
+`command not found` after a successful install. `ssh host 'command'` starts a
+*non-interactive, non-login* shell, which reads only `/etc/zshenv` and
+`~/.zshenv` — never `~/.zshrc` or `~/.profile`, which is where installers put
+their PATH lines. So the tool works when you SSH in and type it by hand, and
+fails when a script runs it, which reads like a broken install but is not one.
+
+Failing that, `~/.local/bin/mpremote` in full works with no shell config at all.
+
+Serial access needs the **`dialout`** group. `id -nG` to check; if it is missing,
+`sudo usermod -aG dialout $USER` and log out and back in.
+
+#### The daily loop
+
+```bash
+scp "pi pico/picoW/robot.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/robot.py'
+```
+
+The full path is spelled out so this works with no shell config at all. With the
+`~/.zshenv` line above in place you can shorten it to plain `mpremote`. `scp`
+never needed it either way — it invokes `/usr/bin/scp` on the remote directly
+rather than looking a name up on your `PATH`.
+
+**The `-t` matters.** It allocates a pseudo-terminal so Ctrl-C actually reaches
+`mpremote` and the script's `finally` block gets to run — centring the head and
+releasing the PWM slices. Without a tty the interrupt may never arrive, the
+cleanup is skipped, and the servo keeps holding position under power because PWM
+is a hardware peripheral that outlives the program that started it.
+
+Install it to run standalone off a USB power bank:
+
+```bash
+scp "pi pico/picoW/robot.py" my-pi:/tmp/ && ssh my-pi '~/.local/bin/mpremote cp /tmp/robot.py :main.py && ~/.local/bin/mpremote reset'
+```
+
+Quickest end-to-end check that the cable, port and firmware are all good — it
+needs no external wiring at all:
+
+```bash
+ssh my-pi '~/.local/bin/mpremote exec "import machine; machine.Pin(\"LED\", machine.Pin.OUT).value(1)"'
+```
+
+On a Pico **W** that is `Pin("LED")`, not `Pin(25)`; see
+[Pico vs Pico W](#pico-vs-pico-w).
+
 ---
 
 ## When it gets stuck
 
 **`could not open device` / `device busy`** — something else already holds the port.
 Close the other repl/serial monitor. Only one process at a time.
+
+**`mpremote: command not found` over SSH, but it works when you SSH in and type
+it.** Not a broken install. `ssh host 'command'` runs a non-interactive,
+non-login shell that reads only `~/.zshenv`, while installers add their PATH line
+to `~/.zshrc` or `~/.profile`. See
+[Driving the board through a Raspberry Pi over SSH](#5-driving-the-board-through-a-raspberry-pi-over-ssh).
+
+**`OSError: [Errno 5] Input/output error` from a long `mpremote` traceback, part
+way through a servo script.** Not a code fault. The board dropped off USB and the
+file descriptor `mpremote` was holding went invalid. The servo's inrush current
+collapsed VBUS.
+
+Confirm it rather than guessing — the kernel log names the cause outright:
+
+```bash
+ssh my-pi 'dmesg | tail -30; vcgencmd get_throttled; vcgencmd get_config usb_max_current_enable'
+```
+
+Look for `over-current change`, `USB disconnect` followed by a re-enumeration a
+fraction of a second later, and `Undervoltage detected!`. Seen here on a Pi 5:
+
+```
+usb usb2-port1: over-current change #1
+usb 3-1: USB disconnect, device number 3
+usb 3-1: new full-speed USB device number 4
+hwmon hwmon3: Undervoltage detected!
+usb_max_current_enable=0      <- 600mA total across ALL ports
+throttled=0x50000             <- under-voltage and throttling have occurred
+```
+
+A Pi 5 restricts USB to **600mA total** unless its firmware sees a supply it
+trusts (the official 27W USB-PD one), which raises it to 1.6A. An SG90 alone
+pulls 700mA-1A on inrush.
+
+**Fix: give the servo its own 5V supply.** Its red lead comes off VBUS entirely
+and goes to a power bank or battery pack; its ground joins *both* that supply's
+ground and the Pico's GND rail; the signal stays on GP15. The shared ground is
+mandatory — without it the servo has no reference for the pulse and ignores it.
+Do not join the external 5V to VBUS. A 470-1000uF capacitor across the servo
+supply smooths the inrush.
+
+`usb_max_current_enable=1` in `/boot/firmware/config.txt` only removes the
+limiter, it does not create current. With under-voltage already logged, that
+browns out the whole Pi and risks corrupting the SD card. Fix the supply instead.
+
+Sensor (~15mA) and buzzer (~9mA) draw nothing by comparison, so
+`ultrasonic_test.py` and `buzzer_test.py` run fine on a restricted port. Only the
+servo needs this.
+
+**No `/dev/ttyACM0` on the Pi.** Confirm the board is actually on that host —
+`lsusb | grep 2e8a` should show `2e8a:0005`. An empty result means the USB cable
+is still in the other machine; the Pico can only be attached to one at a time.
 
 **The board is unreachable because `main.py` is hogging the CPU.** An infinite
 `uasyncio` loop does this, so it happens often:
@@ -272,14 +396,19 @@ uv run mpremote cp "pi pico/picoW/robot.py" :main.py && uv run mpremote reset
 
 | Part | Signal | Physical pin | Power |
 |---|---|---|---|
-| SG90 servo | GP15 | 20 | VBUS (pin 40) |
+| SG90 servo | GP15 | 20 | **its own 5V supply** — not the Pico |
 | HC-SR04 TRIG | GP2 | 4 | VBUS (pin 40) |
 | HC-SR04 ECHO | GP3 **via 1k/2k divider** | 5 | |
 | Passive buzzer | GP16 **via 330R** | 21 | GPIO, or 3V3 (pin 36) for 3-pin modules |
 
-All grounds common, to a Pico GND (pin 38). The servo and HC-SR04 genuinely need
-5V — **never 3V3**, that rail is the RP2040's own regulator and a servo will brown
-it out mid-move.
+All grounds common, to a Pico GND (pin 38) — including the servo's external
+supply. The servo and HC-SR04 genuinely need 5V; **never 3V3**, that rail is the
+RP2040's own regulator and a servo will brown it out mid-move.
+
+**The servo does not go on VBUS either.** An SG90 pulls 700mA–1A on inrush, which
+current-limits the USB port and knocks the Pico off the bus mid-move. See
+[the `Errno 5` entry](#when-it-gets-stuck) for the kernel-log evidence. The
+HC-SR04 (~15mA) and buzzer (~9mA) are fine on VBUS.
 
 ECHO pulses to 5V and the Pico's GPIOs are 3.3V-only, so the divider is not
 optional; without it the pin eventually dies.
