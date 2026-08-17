@@ -25,6 +25,30 @@ Adding them up on paper says it fits. Paper is not evidence -- inrush is
 transient, and a 600mA limiter reacts to peaks, not to averages. So escalate
 for real and let the hardware answer.
 
+WHAT IT ACTUALLY COSTS THE HOST -- measured, not estimated
+
+Sampled on the Pi 5 while robot.py ran with everything active:
+
+    robot total                ~314mA   ~1.6W of the 600mA port budget
+    EXT5V_V under load     4.977-5.026V  no sag, drifts up as often as down
+    kernel log after dmesg -C   empty   no over-current, disconnect or undervolt
+    mpremote on the Pi          24MB    0.2% of 8GB, ~1% of one core
+    Pi load average          unchanged  0.17 before, 0.17 during
+
+Note `lsusb` reports 250mA for the board. Ignore it: bMaxPower is what the
+Pico's USB descriptor DECLARES, not what the robot draws.
+
+The 600mA cap is worth understanding the right way round. It protects the HOST,
+not the robot: exceed it and the port trips, the Pico drops off the bus with
+Errno 5, and the host's own work carries on untouched. The blast radius of a
+power mistake here is this robot and nothing else.
+
+Two honest limits on those figures. vcgencmd was sampled at 1Hz and cannot see
+a millisecond inrush spike -- the instrument that can is the kernel's
+over-current message, which is why an empty dmesg is the load-bearing evidence
+rather than the voltage readings. And the 600mA is shared across ALL the host's
+USB ports, so plugging in a second powered device changes the arithmetic.
+
 HOW TO READ THE RESULT
 
 Each stage prints before it starts and after it survives. If the Pico browns

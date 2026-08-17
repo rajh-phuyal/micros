@@ -278,8 +278,56 @@ Sensor (~15mA) and buzzer (~9mA) draw nothing by comparison, so
 servo needs this.
 
 **No `/dev/ttyACM0` on the Pi.** Confirm the board is actually on that host —
-`lsusb | grep 2e8a` should show `2e8a:0005`. An empty result means the USB cable
-is still in the other machine; the Pico can only be attached to one at a time.
+`lsusb | grep 2e8a` should show `2e8a:0005`. An empty result has two very
+different causes and plain `lsusb` separates them: if the other buses and their
+devices are still listed, the cable is in the other machine and the Pico can
+only be attached to one at a time. If **nothing but root hubs** is listed, skip
+to the next entry — the Pico is innocent.
+
+**`mpremote: no device found`, and `lsusb` lists only root hubs.** The Pi's USB
+host controller has crashed and taken the board down with it. Unplugging and
+replugging the Pico does nothing, because there is no controller left for it to
+enumerate onto. The kernel log names it outright:
+
+```bash
+ssh my-pi 'dmesg | grep -E "xhci|HC died" | tail'
+```
+
+```
+xhci-hcd xhci-hcd.1: xHCI host not responding to stop endpoint command
+xhci-hcd xhci-hcd.1: xHCI host controller not responding, assume dead
+xhci-hcd xhci-hcd.1: HC died; cleaning up
+usb 3-1: USB disconnect, device number 22
+```
+
+Tell it apart from the power failure above by what is *absent*: no
+`over-current change`, no `Undervoltage detected!`, and `get_throttled`
+unchanged. It is not a current problem, so re-auditing the power budget is
+wasted effort — the board's own enumerations were clean right up to the crash.
+
+Reset the controller in place instead of rebooting:
+
+```bash
+ssh -t my-pi 'sudo sh -c "echo -n xhci-hcd.1 > /sys/bus/platform/drivers/xhci-hcd/unbind; sleep 2; echo -n xhci-hcd.1 > /sys/bus/platform/drivers/xhci-hcd/bind"'
+```
+
+On a Pi 5, `xhci-hcd.1` serves buses 3 and 4 and `xhci-hcd.0` serves buses 1 and
+2 — `dmesg` says which one died. Everything on that controller drops and
+re-enumerates, so check what else is attached first; with only the Pico there,
+nothing else notices. Confirm it came back:
+
+```bash
+ssh my-pi 'lsusb; ls -l /dev/ttyACM*'
+```
+
+If the rebind does not revive it, reboot. A controller that has been "assumed
+dead" cannot always be re-initialised from userspace.
+
+*What seems to provoke it:* rapid re-enumeration. Seen here after four
+`mpremote reset` calls inside 74 seconds — USB device numbers 19, 20, 21, 22 —
+with the controller dying about five minutes later while the board sat idle.
+The delay makes that circumstantial rather than proven, but batching checks into
+one `mpremote` invocation instead of resetting repeatedly costs nothing.
 
 **The board is unreachable because `main.py` is hogging the CPU.** An infinite
 `uasyncio` loop does this, so it happens often:
@@ -491,3 +539,7 @@ its own ping — and reports whatever is behind your hand instead.
 - [MicroPython `rp2` quick reference](https://docs.micropython.org/en/latest/rp2/quickref.html) — Pin, PWM, ADC, I2C, SPI on the Pico
 - [Raspberry Pi Pico series documentation](https://www.raspberrypi.com/documentation/microcontrollers/pico-series.html) — datasheets, pinout diagrams
 - [Connecting to the Internet with Raspberry Pi Pico W](https://datasheets.raspberrypi.com/picow/connecting-to-the-internet-with-pico-w.pdf) — the WiFi book, needed for anything network-controlled
+
+
+my command chain to work: 
+`scp "pi pico/picoW/robot.py" my-pi:/tmp/ && ssh -t my-pi '~/.local/bin/mpremote run /tmp/robot.py' || ssh my-pi '~/.local/bin/mpremote reset'`

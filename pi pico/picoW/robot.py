@@ -16,11 +16,17 @@ individual test scripts; run those first if a part misbehaves.
     HC-SR04 ECHO    ->  1k/2k divider -> GP3 physical pin 5    ultrasonic_test.py
     buzzer signal   ->  330R -> GP16         physical pin 21   buzzer_test.py
     LED strip DIN   ->  330R -> GP18         physical pin 24   led_test.py
+    PIR motion OUT  ->  1k   -> GP14         physical pin 19   pir_test.py
 
     HC-SR04 V+      ->  VBUS                 physical pin 40   (5V)
     servo V+        ->  VBUS  -- read the power section below
     LED strip +5    ->  VBUS
+    PIR V+          ->  VBUS (the + rail)
     all GND         ->  GND rail -> GND      physical pin 38
+
+    (the PIR's 1k is in SERIES, not a divider. Its OUT should be 3.3V from
+     the module's own regulator, but this unmarked clone cannot be verified,
+     and one series resistor makes a 5V output safe too -- pir_test.py)
 
     (a 3-pin buzzer module's middle pin goes to 3V3, physical pin 36)
     (the strip is one-way -- use the end marked DIN, never DO)
@@ -79,18 +85,35 @@ script that imported a shared servo/sonar/buzzer module would only work after
 copying those modules to the board first. Keeping one file means this runs the
 moment you save it. The duplication is the price and it is worth it here.
 
-BEHAVIOUR
+BEHAVIOUR -- it BOOTS ASLEEP. Power-up is a single falling blip and darkness;
+the fanfare waits until the PIR actually sees someone.
 
+    DOZE    the boot state. Dark, limp, silent. Deaf for the first 60s while
+            the PIR's reference settles (it fires phantoms the whole time --
+            measured, pir_test.py), double-speed LED blink; then listening,
+            slow blink, until motion wakes it into SEARCH.
     SEARCH  sweep the whole arc looking for anything within DETECT_CM.
             Nothing for a couple of passes -> a bored sigh, then PATROL.
     PATROL  a slow continuous glide across the room, pinging as it goes,
             breaking off the instant it hears something worth checking.
+    NAP     the room has stayed empty through repeated patrols: head parked
+            and limp, lights out, buzzer silent. Only the PIR keeps watch --
+            a warm body moving anywhere in its ~110 degree cone wakes the
+            robot straight back into SEARCH. This is what lets it be left
+            plugged in: an empty room costs the bare Pico's draw instead of
+            a servo sweeping for nobody.
     GREET   fired once when a visitor first appears: turn to face them,
             waggle the head, and chirp a rising hello.
     TRACK   HOLD STILL and re-ping the current bearing. Only when the reading
             actually changes does it glance either side, and only if that
             fails does it look wider. Lose them for LOST_LIMIT tries -> sad
             note, back to SEARCH.
+            One escape hatch: a reading pinned DEAD-FLAT for many cycles
+            while the PIR says something warm is moving is a hold on
+            furniture, not a person -- people breathe and sway, chairs do
+            not. It gives up on the spot, remembers its position so the next
+            sweep does not just re-greet the same chair, and searches for
+            whatever actually moved.
 
 The greeting only fires on a NEW visitor. Standing still in front of it will
 not set it off repeatedly -- it has to lose you first.
@@ -116,6 +139,12 @@ scanning or patrolling, strip.head() lights the pixel matching the servo's
 bearing with its neighbours dimmer, so you can see where the robot is looking
 without watching the head. Amber while searching, green once it has something.
 
+That readout depends on WHERE THE STRIP IS PHYSICALLY MOUNTED, which is the one
+thing this file cannot measure. As wrapped around the base today, pixels 1-3
+are the right flank, 4-6 the front, 7-8 the left -- 3/3/2, so the pixels are
+not evenly spaced in bearing and PIXEL_DEG spells out each one's actual angle.
+Re-mount the strip and PIXEL_DEG is what needs editing, not head().
+
 Colour is chosen by mood, not by state machine: each mood function sets the
 strip on entry and leaves it in the correct resting colour on exit, exactly as
 each one already leaves the head on target. Nothing in the main loop paints.
@@ -125,6 +154,11 @@ draw before sending it and scales the whole frame down if it would exceed
 STRIP_MA, which is what lets the strip share VBUS with the servo. Scaling the
 whole frame rather than each pixel preserves relative brightness, so hues and
 gradients survive -- they just get dimmer.
+
+Two knobs, and they are not interchangeable. BRIGHTNESS is the one to turn for
+looks: it scales every frame evenly. STRIP_MA is a safety ceiling and only acts
+on frames that would breach it, so turning it down leaves a single lit pixel
+exactly as bright and merely clamps the full-white moments harder.
 
 Animations are only used where a pause already existed to spend. be_sulky's
 drain consumes the sulk instead of adding to it, and be_bored's breathe
@@ -147,7 +181,10 @@ WHAT THIS CANNOT DO -- worth knowing before blaming the code:
     inherently laggy -- about 1.5s per update -- and no amount of code fixes
     it with one fixed sensor.
   * It follows the NEAREST thing, not a particular thing. Put a closer object
-    in front of it and it switches allegiance. There is no object identity.
+    in front of it and it switches allegiance. There is no object identity --
+    the stale-hold escape fakes a little of it (a spot written off as
+    furniture is remembered by bearing+distance and skipped), but that is a
+    memory of one place, not recognition of anything.
   * Below ~15cm the sensor is deaf -- it is still ringing from its own ping
     when the echo gets back, so it reports whatever is BEHIND your hand
     instead. A hand at 5cm reading 200cm is physics, not a bug.
@@ -170,6 +207,65 @@ TRIG_PIN = 2
 ECHO_PIN = 3
 BUZZER_PIN = 16
 LED_PIN = 18
+PIR_PIN = 14
+
+# --- motion sensor ---------------------------------------------------------
+# HC-SR501 PIR. One bit and NO DIRECTION: it says when something moved, never
+# where, so bearings stay the job of the servo + ultrasonic sweep. Its whole
+# job here is ending the nap.
+#
+# This particular board is in single-trigger mode (measured, pir_test.py): a
+# person moving continuously shows up as a 1.2s high roughly every 4.5s, with
+# a ~3s blind gap after each one. Nothing below relies on the high LASTING --
+# only on one arriving -- so both jumper modes behave identically and the
+# unmarked jumper never needs to be found.
+
+# The sensor free-runs phantom triggers while its reference settles after
+# power-on: pir_test.py counted 20 in one measured minute. Trusting it early
+# means waking for ghosts, so the robot refuses to nap until this has passed.
+# Counted from boot -- the sensor powered up with the board, and its clock has
+# been running however busy the robot has been since.
+PIR_WARMUP_MS = 60_000
+
+# Empty patrols in a row before it gives up on the room and naps. Two, not
+# one: a single empty patrol happens whenever a visitor walks off mid-track,
+# and napping the moment they reach the door would read as sulking.
+NAP_AFTER_PATROLS = 2
+
+# Poll interval while napping. 50ms against a 1.2s pulse cannot miss; the CPU
+# spends the gap in sleep_ms, which is most of why napping is cheap.
+NAP_POLL_MS = 50
+
+# --- stale-hold escape: depth + motion together ----------------------------
+# "hold" means the thing ahead keeps reading the same distance. A person is
+# never that steady -- breathing and swaying wander the reading a few cm --
+# but a chair is exactly that steady. So a reading pinned within STALE_CM for
+# STALE_LIMIT straight cycles, WHILE the PIR says a warm body is moving
+# somewhere in the room, means the robot is staring at furniture and the
+# visitor is elsewhere. Depth says "this is not them"; motion says "they are
+# here somewhere". Either signal alone proves nothing: flat-plus-quiet is a
+# sleeping cat worth watching, and motion alone is the person in front
+# shifting their weight.
+STALE_CM = 2            # dead-flat band; tighter than HOLD_TOLERANCE_CM
+STALE_LIMIT = 25        # quiet hold cycles are ~0.4s, so roughly 10s of flat
+MOTION_FRESH_MS = 8000  # this PIR pulses ~every 4.5s under continuous motion
+
+# Abandoned spots are remembered by position -- bearing and distance -- and
+# sweeps skip anything matching one. Without this the very next sweep would
+# re-find the same chair (it is still the nearest thing in range) and solemnly
+# greet it again, forever. The signatures survive naps on purpose: the chair
+# is still there after a nap, and forgetting it would restart the greet loop.
+# The price is a person standing at that exact bearing AND within IGNORE_CM of
+# that exact distance being skipped too -- kept small so "in front of the
+# chair" reads as nearer than the chair, which is visible.
+#
+# A LIST, not one slot. A room can hold two chairs, and remembering only the
+# latest write-off amnesties the previous one -- simulated, and the robot went
+# straight back to greeting chair number one. Oldest is dropped at the cap:
+# a robot that has blacklisted four spots is probably wrong about one of them.
+IGNORE_DEG = 12
+IGNORE_CM = 5
+IGNORE_MAX = 4
 
 # --- servo -----------------------------------------------------------------
 SERVO_FREQ = 50
@@ -180,7 +276,17 @@ SERVO_MAX_US = 2500
 # --- scanning --------------------------------------------------------------
 # Stay off the mechanical stops. An SG90 straining against its own end stop
 # will cook its gears.
-SCAN_MIN_DEG = 15
+#
+# The left limit is 30 rather than 15 for a second reason: reaction torque.
+# Every time the head accelerates one way the base wants to rotate the other,
+# and a light base loses -- at 15 it was visibly turning itself. Cutting the
+# far end of the travel shortens the longest move, which is the one that builds
+# the most momentum. If it still creeps, GLIDE and PATROL_DEG_PER_S are the
+# other half of the same problem: torque comes from acceleration, not reach.
+#
+# Rising degrees turn the head RIGHT on this build, so SCAN_MIN_DEG is the LEFT
+# extreme. Same convention PIXEL_DEG is built around.
+SCAN_MIN_DEG = 30
 SCAN_MAX_DEG = 165
 CENTRE_DEG = 90
 
@@ -277,10 +383,22 @@ PIXELS = 8
 # ALONE and the servo needs its glide current back. 50mA is what power_test.py
 # verified with everything running at once.
 #
-# This is the single knob for strip brightness. Raise it in ~20mA steps and
-# re-run power_test.py with the kernel log each time -- do not just turn it up
-# and hope, because the failure mode is the Pico dropping off USB mid-move.
+# Raise it in ~20mA steps and re-run power_test.py with the kernel log each
+# time -- do not just turn it up and hope, because the failure mode is the Pico
+# dropping off USB mid-move.
 STRIP_MA = 50
+
+# How bright the strip actually is, 0.0 to 1.0. THIS is the knob to turn for
+# looks; STRIP_MA is a safety ceiling and makes a poor dimmer.
+#
+# The difference matters. STRIP_MA only bites on frames that would exceed it,
+# so lowering it does nothing at all to a frame already under budget -- a
+# single lit pixel stays exactly as bright and only the full-white moments get
+# clamped harder. BRIGHTNESS scales every frame uniformly, ceiling included, so
+# the whole robot dims together and the relative brightness between moods
+# survives. It cuts real current too, so lowering it is always safe; raising it
+# above 1.0 is not, and STRIP_MA is what stops that becoming dangerous.
+BRIGHTNESS = 0.4
 
 # A WS2812B is three ~20mA LEDs plus a controller that draws ~1mA even dark.
 # Datasheets say 20mA/channel and real parts come in slightly under, so this
@@ -311,6 +429,39 @@ def dim(colour, f):
 # almost all the time, so they set the robot's idle draw and its idle mood.
 RESTING_SEARCH = dim(AMBER, 0.35)
 RESTING_HOLD = dim(GREEN, 0.3)
+
+# Where each pixel actually points, in the servo's own degree frame.
+#
+# The strip is wrapped around the base rather than laid out straight, so the
+# pixels are NOT evenly spread across the head's arc:
+#
+#     pixels 1-3  right flank        pixels 4-6  front        pixels 7-8  left
+#     (indices 0-2)                  (indices 3-5)            (indices 6-7)
+#
+# Three faces, 3/3/2, which means head() cannot just interpolate across the
+# scan range -- it has to know each pixel's bearing and pick the nearest. The
+# front three straddle CENTRE_DEG so that dead ahead lights index 4, and the
+# flanks divide up what is left of SCAN_MIN_DEG..SCAN_MAX_DEG.
+#
+# The ORDER also encodes which way the servo turns: rising degrees swing the
+# head to the RIGHT on this build, so the right flank holds the HIGH bearings.
+# That was measured, not assumed -- with this table ascending, the head and the
+# lit pixel travelled in opposite directions, and the readout parked on the
+# right flank while the robot was tracking something off to its left.
+#
+# To re-mount the strip, edit this table and nothing else. To flip direction,
+# reverse the whole table. Do NOT mirror the index instead: that keeps the
+# bearings in place while moving the faces, which is only harmless if the
+# layout is symmetric, and 3/3/2 is not.
+PIXEL_DEG = (158, 145, 132,    # right flank
+             110, 90, 70,      # front, centred on CENTRE_DEG
+             48, 26)           # left flank
+
+if len(PIXEL_DEG) != PIXELS:
+    # Easy to edit one and forget the other, and the symptom would be a
+    # readout that silently ignores the last pixel rather than an error.
+    raise SystemExit("PIXEL_DEG has %d entries but PIXELS is %d"
+                     % (len(PIXEL_DEG), PIXELS))
 
 # --- personality -----------------------------------------------------------
 # duty_u16. 32768 is a 50% square wave, which is as loud as a passive buzzer
@@ -409,6 +560,17 @@ class Servo:
                     return found
         return None
 
+    def rest(self):
+        """Stop sending pulses without tearing the PWM down.
+
+        A servo with no pulses goes limp and stops drawing hold current, but
+        the slice stays configured, so the next _write() resumes exactly where
+        release() would have needed a full re-init. The head keeps whatever
+        angle friction gives it -- fine for a nap, since wake() snaps to
+        centre anyway and self.current still records where it was left.
+        """
+        self.pwm.duty_u16(0)
+
     def release(self):
         self.pwm.deinit()
 
@@ -484,7 +646,18 @@ class Strip:
         # reduced by dimming, so including it in the ratio would over-scale.
         budget = STRIP_MA - self.n * QUIESCENT_MA
         wanted = self.estimate_ma(frame) - self.n * QUIESCENT_MA
-        scale = budget / wanted if wanted > budget and wanted > 0 else 1.0
+        # The ceiling is worked out at FULL brightness, then BRIGHTNESS scales
+        # the result. Dimming the frame first instead would cancel out on every
+        # frame the ceiling already clamps -- the startle flash and the wake
+        # wipe would ignore the dimmer completely, because their current is
+        # pinned by the budget whatever BRIGHTNESS says. So STRIP_MA is the
+        # budget at full brightness and real draw falls in step with dimming.
+        #
+        # Folded into one multiplier rather than dimming into a new list, to
+        # stay allocation-free: head() runs ~150 times per patrol arc.
+        scale = BRIGHTNESS
+        if wanted > budget and wanted > 0:
+            scale = BRIGHTNESS * budget / wanted
         for i, px in enumerate(frame):
             self.np[i] = (int(px[0] * scale),
                           int(px[1] * scale),
@@ -508,10 +681,18 @@ class Strip:
         robot is looking without watching the servo. One frame costs ~0.3ms,
         far too short to disturb the servo's 20ms frame or time_pulse_us, so
         this drops into scanning and patrol without a timing cost.
+
+        Nearest bearing rather than interpolation, because the pixels are not
+        evenly spaced around the base -- see PIXEL_DEG.
         """
-        span = SCAN_MAX_DEG - SCAN_MIN_DEG
-        pos = int((deg - SCAN_MIN_DEG) * (self.n - 1) / span)
-        pos = max(0, min(self.n - 1, pos))
+        pos = 0
+        nearest = 360
+        for i, bearing in enumerate(PIXEL_DEG):
+            gap = abs(deg - bearing)
+            if gap < nearest:
+                nearest, pos = gap, i
+        # The strip is one continuous arc around the base, so index adjacency
+        # is adjacency in space too -- the dimmed neighbours land either side.
         frame = []
         for i in range(self.n):
             gap = abs(i - pos)
@@ -557,11 +738,59 @@ buzzer = Buzzer(BUZZER_PIN)
 strip = Strip(LED_PIN, PIXELS)
 trig = machine.Pin(TRIG_PIN, machine.Pin.OUT)
 echo = machine.Pin(ECHO_PIN, machine.Pin.IN)
+# Plain input, NO pull. There is a 1k in series with this wire, and a pull
+# resistor on the pin would turn that into a divider and shave the high level.
+# GP14 shares PWM slice 7 with the servo's GP15, which is irrelevant for a
+# digital input -- slice conflicts only exist between two PWM outputs.
+pir = machine.Pin(PIR_PIN, machine.Pin.IN)
+
+# When this board came up -- the PIR warm-up clock. ticks_ms wraps after ~12
+# days, so ticks_diff against this is only valid within the wrap; the check in
+# pir_ready() latches True permanently instead of comparing forever.
+_boot_ms = time.ticks_ms()
+_pir_settled = [False]
 
 # What colour the head-position indicator uses. Amber while hunting, green once
 # it has something. In a list so measure() and the patrol watch can both read
 # the current value without a global statement -- same idiom as _last_ping_ms.
 look_colour = [AMBER]
+
+# Position signatures of everything written off as furniture, newest last.
+# Module-level so sweep() and patrol() can read it without a global statement.
+_ignored = []
+
+# When the PIR last saw anything, or None. Sampled once per main-loop cycle;
+# a pulse lasts >=1.2s and a quiet tracking cycle is ~0.4s, so once per cycle
+# cannot miss one.
+_last_motion_ms = [None]
+
+
+def note_motion():
+    """Remember the moment the PIR last reported a warm body moving."""
+    if pir_ready() and pir.value():
+        _last_motion_ms[0] = time.ticks_ms()
+
+
+def motion_recently():
+    """Did the PIR see anything within the last MOTION_FRESH_MS?"""
+    if _last_motion_ms[0] is None:
+        return False
+    return time.ticks_diff(time.ticks_ms(), _last_motion_ms[0]) <= MOTION_FRESH_MS
+
+
+def matches_ignore(deg, cm):
+    """Is this hit something already written off as furniture?"""
+    for sig_deg, sig_cm in _ignored:
+        if abs(deg - sig_deg) <= IGNORE_DEG and abs(cm - sig_cm) <= IGNORE_CM:
+            return True
+    return False
+
+
+def ignore_spot(deg, cm):
+    """Blacklist a position signature, dropping the oldest at the cap."""
+    _ignored.append((deg, cm))
+    if len(_ignored) > IGNORE_MAX:
+        _ignored.pop(0)
 
 
 # --- sensing ---------------------------------------------------------------
@@ -612,7 +841,8 @@ def sweep(lo, hi, step, samples):
     deg = lo
     while deg <= hi:
         cm = measure(deg, samples)
-        if cm is not None and cm < DETECT_CM:
+        if (cm is not None and cm < DETECT_CM
+                and not matches_ignore(deg, cm)):
             if best_cm is None or cm < best_cm:
                 best_deg = deg
                 best_cm = cm
@@ -793,6 +1023,97 @@ def wake():
     strip.fill(RESTING_SEARCH)
 
 
+def pir_ready():
+    """Has the PIR's power-on settling window passed?
+
+    Latched rather than recomputed, because ticks_ms wraps around after long
+    enough and a plain ticks_diff comparison would eventually flip back to
+    False on a robot that has been plugged in for days.
+    """
+    if not _pir_settled[0]:
+        if time.ticks_diff(time.ticks_ms(), _boot_ms) >= PIR_WARMUP_MS:
+            _pir_settled[0] = True
+    return _pir_settled[0]
+
+
+def _wait_for_motion():
+    """Block, dark, until the PIR reports a warm body. The heartbeat blink on
+    the onboard LED is the only sign of life -- a dark robot must be tellable
+    from a dead one."""
+    # If whatever ended the last behaviour is still holding OUT high, arming
+    # now would end the nap before it began. Wait for a clean low first -- in
+    # this board's single-trigger mode that is at most the 1.2s pulse tail.
+    while pir.value():
+        time.sleep_ms(NAP_POLL_MS)
+
+    ticks = 0
+    while not pir.value():
+        time.sleep_ms(NAP_POLL_MS)
+        ticks += 1
+        if ticks % (3000 // NAP_POLL_MS) == 0:
+            led.toggle()   # slow heartbeat: asleep, not dead
+
+    led.value(1)
+    print("motion -- waking")
+    # The full power-up fanfare, not a special quiet one. Someone just walked
+    # in; the robot noticing them loudly is the feature.
+    wake()
+
+
+def doze():
+    """Boot state: dark, limp and silent until the PIR proves someone is here.
+
+    The robot does not announce itself at power-on -- it waits to be found.
+    The servo has never been sent a pulse at this point, so the head is
+    genuinely limp rather than parked, and the only startup sound is a small
+    falling blip to say the power is on.
+
+    The first minute is spent DEAF. pir_test.py measured 20 phantom triggers
+    while the sensor's reference settled after power-on, and waking to greet
+    every one of them would defeat the whole point of booting asleep. So the
+    settling window is waited out while ignoring the sensor completely --
+    the LED blinks at double speed to show this is warm-up, not the nap --
+    and only then does the pin get believed.
+    """
+    print("dozing -- deaf for %ds of PIR warm-up, then waking on motion"
+          % (PIR_WARMUP_MS // 1000))
+    buzzer.slide(pitch(0.8), pitch(0.5), 150)
+    strip.clear()
+    led.value(0)
+
+    ticks = 0
+    while not pir_ready():
+        time.sleep_ms(NAP_POLL_MS)
+        ticks += 1
+        if ticks % (1500 // NAP_POLL_MS) == 0:
+            led.toggle()   # double-speed blink: settling, not yet listening
+
+    led.value(0)
+    _wait_for_motion()
+
+
+def nap():
+    """The room has stayed empty. Go dark and let the PIR keep watch.
+
+    Everything winds down in view: a falling yawn, the head easing to centre
+    at sulk speed, and the light draining out pixel by pixel. Then the servo
+    stops receiving pulses entirely -- limp, silent, no hold current -- and
+    the only activity left is a 50ms poll of one input pin.
+
+    Blocks until motion. That is the point: this is the robot's whole
+    existence between visitors, and it costs the bare Pico plus the strip's
+    ~8mA of quiescent controller draw -- the pixels are dark, but a WS2812B
+    controller draws its ~1mA regardless.
+    """
+    print("nap -- PIR watching, everything else off")
+    buzzer.slide(pitch(0.9), pitch(0.45), 400)   # a yawn, falling off the peak
+    servo.glide(CENTRE_DEG, SULK_DEG_PER_S)
+    strip.drain(dim(WHITE, 0.5), 1500)
+    servo.rest()
+    led.value(0)
+    _wait_for_motion()
+
+
 # --- patrol ----------------------------------------------------------------
 
 # Timestamp of the last patrol ping, in a list so the watch closure can write
@@ -839,9 +1160,11 @@ def patrol():
             continue
         deg = hint[0]
         cm = measure(deg, 3)     # stopped now, so this one counts
-        if cm is not None and cm < DETECT_CM:
+        if (cm is not None and cm < DETECT_CM
+                and not matches_ignore(deg, cm)):
             return deg, cm
-        # False alarm from a moving reading. Carry on from where it stopped.
+        # False alarm from a moving reading -- or the ignored furniture
+        # again. Carry on from where it stopped.
     return None, None
 
 
@@ -895,20 +1218,31 @@ heading = CENTRE_DEG
 searching = True
 lost = 0
 empty_sweeps = 0
+empty_patrols = 0  # consecutive patrols that found nothing -> naps at the limit
 last_cm = None
 blocked = 0        # consecutive cycles with something in its face
+stale = 0          # consecutive hold cycles with a dead-flat reading
 
 try:
-    # wake() MUST be inside the try. It drives the servo and takes the best
-    # part of a second, and anything that moves hardware before the try has
-    # no finally to undo it -- a Ctrl-C landing in that window leaves the PWM
-    # slice enabled and the head stiffly holding, which looks exactly like
-    # Ctrl-C being ignored. That is precisely the moment you press it if you
-    # start the robot and immediately change your mind.
-    wake()
+    # doze() MUST be inside the try -- it ends by calling wake(), which drives
+    # the servo, and anything that moves hardware before the try has no
+    # finally to undo it. A Ctrl-C landing mid-fanfare would otherwise leave
+    # the PWM slice enabled and the head stiffly holding, which looks exactly
+    # like Ctrl-C being ignored -- and that is precisely the moment you press
+    # it if you start the robot and immediately change your mind.
+    #
+    # Asleep FIRST, awake second. The robot boots dark and waits to be found:
+    # no wake fanfare until the PIR sees an actual person. Ctrl-C works
+    # throughout the doze.
+    doze()
     print("awake -- Ctrl-C to stop")
 
     while True:
+        # Sample the PIR every cycle, whatever state the robot is in -- the
+        # stale-hold escape needs to know whether anything moved RECENTLY,
+        # and a pulse missed here is a pulse forgotten.
+        note_motion()
+
         if searching:
             # Amber while hunting. Set here rather than once on entry because
             # the searching branch is also re-entered after a sulk or a lost
@@ -931,12 +1265,26 @@ try:
                     print("bored")
                     be_bored()
                     deg, cm = patrol()
+                    if deg is None:
+                        empty_patrols += 1
+                        # Enough empty patrols means the room really is empty,
+                        # and the PIR takes over -- but only once its warm-up
+                        # has passed. Before that it fires at ghosts, so the
+                        # robot keeps patrolling instead: a visibly moving
+                        # robot beats one that wakes for nobody.
+                        if empty_patrols >= NAP_AFTER_PATROLS and pir_ready():
+                            empty_patrols = 0
+                            nap()   # blocks until the PIR sees motion
+                    else:
+                        empty_patrols = 0
                 if deg is None:
                     continue
 
             heading, last_cm = deg, cm
             searching, lost, empty_sweeps = False, 0, 0
             blocked = 0
+            stale = 0
+            empty_patrols = 0   # a visitor resets the give-up-and-nap count
             look_colour[0] = GREEN   # it has something now
             print("hello!  %3d deg  %5.0f cm" % (heading, cm))
             greet(heading)
@@ -953,6 +1301,7 @@ try:
         if too_close(cm, last_cm, blocked):
             blocked += 1
             lost = 0
+            stale = 0   # being crowded is the opposite of a dead room
             print("too close! (%d)" % blocked)
             if blocked >= SULK_LIMIT:
                 print("sulking")
@@ -973,6 +1322,27 @@ try:
 
         if settled:
             lost = 0
+
+            # Dead-flat is flatter than merely settled. Within STALE_CM cycle
+            # after cycle is furniture-grade stillness; a live person drifts.
+            if last_cm is not None and abs(cm - last_cm) <= STALE_CM:
+                stale += 1
+            else:
+                stale = 0
+
+            if stale >= STALE_LIMIT and motion_recently():
+                # The thing ahead has not moved a hair in ~10s, and the PIR
+                # says a warm body IS moving somewhere in its cone. So the
+                # thing being stared at is not the thing that is alive.
+                # Remember the spot so the next sweep skips it, admit defeat,
+                # and go find the mover.
+                print("stale  %3d deg  %5.0f cm -- motion elsewhere, searching"
+                      % (heading, cm))
+                ignore_spot(heading, cm)
+                searching, last_cm, stale = True, None, 0
+                be_sad()
+                continue
+
             if last_cm is not None and cm < last_cm - APPROACH_CM:
                 print("wary   %3d deg  %5.0f cm" % (heading, cm))
                 be_wary()
@@ -992,6 +1362,7 @@ try:
         # Escalate: a glance either side, and only then a proper look. Trying
         # the narrow span first means small movements cost one short sweep
         # instead of a full wide one.
+        stale = 0
         deg = None
         for span in (NUDGE_SPAN, WIDE_SPAN):
             lo = max(SCAN_MIN_DEG, heading - span)
