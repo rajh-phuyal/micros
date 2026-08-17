@@ -83,6 +83,10 @@ class Servo:
         self.pwm.deinit()
 
 
+# Onboard LED on as a liveness indicator -- lit means the board has power and
+# got as far as running this.
+machine.Pin("LED", machine.Pin.OUT).value(1)
+
 servo = Servo(SERVO_PIN)
 
 try:

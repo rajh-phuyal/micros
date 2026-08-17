@@ -76,6 +76,10 @@ TIMEOUT_US = 30_000
 # fast enough that moving your hand tracks smoothly.
 INTERVAL_MS = 70
 
+# Onboard LED on as a liveness indicator -- lit means the board has power and
+# got as far as running this.
+machine.Pin("LED", machine.Pin.OUT).value(1)
+
 trig = machine.Pin(TRIG_PIN, machine.Pin.OUT)
 echo = machine.Pin(ECHO_PIN, machine.Pin.IN)
 

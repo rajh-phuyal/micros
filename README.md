@@ -184,6 +184,31 @@ wipe the flash completely (files *and* firmware), drag
 uv run mpremote reset
 ```
 
+**The servo or buzzer won't stop, and Ctrl-C seems to do nothing.** PWM is a
+*hardware* peripheral — once configured it keeps generating pulses with no CPU
+involvement, so killing the Python doesn't kill the output. Only `deinit()` or a
+chip reset does. Every script here releases its PWM in a `finally` block; the trap
+is anything that drives hardware *before* the `try`, which has no `finally` to
+unwind it. The nuclear option always works:
+
+```bash
+uv run mpremote reset
+```
+
+**After a reset the servo sits at some odd angle and feels dead.** That's correct
+behaviour, not a fault. A servo has no holding torque without a signal and never
+self-centres — with no PWM it simply stays limp wherever it was left. Push it with
+a finger: if it moves freely, it's released, not jammed.
+
+**Verify what the hardware is actually doing** rather than guessing — read the
+RP2040 registers directly:
+
+```bash
+uv run mpremote exec "import machine; b=0x40050000+0x14*7; print('slice7 CSR=0x%08x enabled=%d' % (machine.mem32[b], machine.mem32[b]&1)); print('GP15 FUNCSEL=%d (4=PWM, 5=SIO, 31=reset default)' % (machine.mem32[0x40014000+8*15+4]&0x1f))"
+```
+
+Slice is `(GP / 2) % 8`, and its register block is at `0x40050000 + 0x14 * slice`.
+
 ---
 
 ## Pico vs Pico W
@@ -229,21 +254,105 @@ uv run mpremote cp "pi pico/pico/main.py" "pi pico/pico/traffic.py" : && uv run 
 
 ### `pi pico/picoW/` — mini robot
 
-Not started. For now this holds [main.py](pi%20pico/picoW/main.py), a connection
-test that blinks the onboard LED — no wiring, USB cable only. Use it to confirm the
-host↔board link before debugging anything else.
+A head that looks around, greets whatever it finds, and follows it.
+[robot.py](pi%20pico/picoW/robot.py) is the whole thing in one self-contained file.
 
 ```bash
-uv run mpremote run "pi pico/picoW/main.py"
+uv run mpremote run "pi pico/picoW/robot.py"
 ```
 
-[servo_test.py](pi%20pico/picoW/servo_test.py) sweeps a hobby servo on GP15 —
-wiring notes and the pulse-width maths are in its header. Power the servo from
-**VBUS, never 3V3**.
+Install it so it runs from a USB power bank with no laptop attached — note the
+`:main.py` destination, which renames it on the way over:
 
 ```bash
-uv run mpremote run "pi pico/picoW/servo_test.py"
+uv run mpremote cp "pi pico/picoW/robot.py" :main.py && uv run mpremote reset
 ```
+
+#### Wiring
+
+| Part | Signal | Physical pin | Power |
+|---|---|---|---|
+| SG90 servo | GP15 | 20 | VBUS (pin 40) |
+| HC-SR04 TRIG | GP2 | 4 | VBUS (pin 40) |
+| HC-SR04 ECHO | GP3 **via 1k/2k divider** | 5 | |
+| Passive buzzer | GP16 **via 330R** | 21 | GPIO, or 3V3 (pin 36) for 3-pin modules |
+
+All grounds common, to a Pico GND (pin 38). The servo and HC-SR04 genuinely need
+5V — **never 3V3**, that rail is the RP2040's own regulator and a servo will brown
+it out mid-move.
+
+ECHO pulses to 5V and the Pico's GPIOs are 3.3V-only, so the divider is not
+optional; without it the pin eventually dies.
+
+**Pin choice is not free.** RP2040 PWM has 8 slices, each shared by a GPIO pair
+(`slice = (GP / 2) % 8`), and a slice has **one** frequency. The servo needs 50 Hz
+and the buzzer needs kilohertz, so they must be on different slices. GP15 is slice
+7, so GP14 would collide — GP16 (slice 0) is clear.
+
+**The buzzer's series resistor is not decoration.** Two different parts get sold as
+"passive buzzer": a *piezo* disc draws microamps, but a *magnetic* one is a coil of
+a few tens of ohms. `buzzer_id.py` measured this one at **~42 Ω — magnetic**, so
+the 330 Ω is the only thing holding the pin to ~9 mA against its 12 mA rating.
+Don't drop it. A two-pin passive buzzer has no polarity that matters; a square wave
+reversed is the same square wave.
+
+That also caps volume at ~3 mW. To go louder the coil has to come off the GPIO
+entirely, onto a small NPN: `GP16 →[1k]→ base`, `3V3 → buzzer → collector`,
+`emitter → GND`, and a **1N4148 across the buzzer, banded end to 3V3** to catch the
+coil's turn-off spike. That's ~74 mA and roughly 18 dB louder — and duty cycle
+becomes a real volume control instead of being pinned at maximum.
+
+#### Test each part before running the robot
+
+Every one of these has a debugging ladder in its header, written from what
+actually went wrong here:
+
+```bash
+uv run mpremote run "pi pico/picoW/main.py"            # LED only, no wiring — is the link alive?
+uv run mpremote run "pi pico/picoW/servo_test.py"      # sweeps GP15
+uv run mpremote run "pi pico/picoW/ultrasonic_test.py" # live distance bar graph
+uv run mpremote run "pi pico/picoW/buzzer_test.py"     # scale, volume steps, slides
+uv run mpremote run "pi pico/picoW/buzzer_tune.py"     # find the buzzer's resonant peak
+uv run mpremote run "pi pico/picoW/buzzer_id.py"       # piezo or magnetic? (needs a GP26 jumper)
+uv run mpremote run "pi pico/picoW/servo_track.py"     # scan-and-point, no sound
+```
+
+**If the buzzer is quiet, it's almost certainly the frequency, not the power.** A
+buzzer is a mechanical resonator with a sharp peak — this one measured **4000 Hz**
+with `buzzer_tune.py`. An octave and a half below that it's inaudibly weak no
+matter what duty cycle you set. `robot.py` expresses every tone as a ratio of
+`PEAK_HZ`, so re-measuring and changing that one constant retunes the whole
+personality and keeps the intervals intact. (Also: 50% duty is the maximum — past
+`32768` the pulse narrows again and it gets *quieter*.)
+
+Three traps that cost real time, all recorded in those headers: a breadboard's
+power rails are **split in the middle** into isolated halves; an unconnected GPIO
+floats on 50 Hz mains hum and reads as a convincing, unchanging ~150 cm; and a
+**passive** buzzer needs a square wave while an **active** one only beeps on DC
+and ignores PWM entirely.
+
+#### Tuning knobs
+
+All at the top of `robot.py`:
+
+| Constant | Does what | Turn it… |
+|---|---|---|
+| `GLIDE_DEG_PER_S` | head travel speed | down for stately, up for frisky |
+| `HOLD_TOLERANCE_CM` | distance drift still counting as "same thing" | up if it fidgets, down if it stares at where you were |
+| `HEADING_DEADBAND` | bearing change too small to bother turning for | up to calm it down |
+| `NUDGE_SPAN` / `WIDE_SPAN` | how far it glances when the reading shifts | up if it loses you when you move |
+| `DETECT_CM` | how far away it notices things | down if it keeps finding furniture |
+| `VOLUME` | duty cycle | only meaningful once a transistor is carrying the current |
+| `PEAK_HZ` | buzzer resonance | re-measure with `buzzer_tune.py` if you swap the buzzer |
+
+#### What it cannot do
+
+The HC-SR04 measures distance and nothing else — it has no idea which direction an
+echo came from. The bearing comes from the servo's own position, so the head must
+sweep to find anything. That makes tracking inherently laggy (~1.5s per update) and
+limits bearing resolution to the beam width, ~15°. It also follows the *nearest*
+thing, not a particular thing. Below ~15 cm the sensor is deaf — still ringing from
+its own ping — and reports whatever is behind your hand instead.
 
 ---
 
